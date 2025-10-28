@@ -1,0 +1,18 @@
+# Streamlit 웹 UI
+streamlit>=1.38.0
+
+# 웹 요청 및 파싱
+requests>=2.32.3
+beautifulsoup4>=4.12.3
+lxml>=5.3.0
+
+# 데이터 처리 및 엑셀 저장
+pandas>=2.2.2
+openpyxl>=3.1.2
+
+# 문자열 정규화 및 유사도 계산
+unicodedata2>=15.1.0
+python-Levenshtein>=0.25.1
+
+# 로깅 및 유틸
+tqdm>=4.66.5
