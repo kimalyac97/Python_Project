@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-네이버 뉴스 수집 v6 + Streamlit UI
-- 기존 v6 로직 그대로 사용 (requests+BS4 전용)
-- 웹 UI에서:
-  * 고객사 엑셀(A열) 기반 수집 ("값" +사고)  → 시트명: 고객사 (A=검색어, B=제목, C=기사내용, D=링크)
-  * 사용자 지정 검색어(줄 단위)              → 시트명: 사용자 지정 (A=검색어, B=제목, C=기사내용, D=링크)
-  * 전력시장 +에너지                          → 시트명: 전력시장 동향 (A=제목, B=기사내용, C=링크)  ※검색어 컬럼 없음
-  * N 최대 1~10(유니크)
+네이버 뉴스 수집 v6 + Streamlit UI (개선판)
+- 엔터(Enter)로 사용자 지정 검색어 제출 시 입력창 자동 숨김(닫힌 효과)
+- requests Response 및 Session 명시적 close()로 파일/소켓 핸들 누수 방지
+- 필요 시 Connection: close 헤더로 keep-alive 최소화
 """
 
 import os, re, io, time, random, logging, sys
@@ -35,7 +32,7 @@ UA_POOL = [
 COMMON_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5",
-    "Connection": "keep-alive",
+    "Connection": "close",  # keep-alive 대신 close로 누수 위험 감소
     "Upgrade-Insecure-Requests": "1",
     "Referer": HOMEPAGE,
 }
@@ -60,7 +57,7 @@ def jitter_sleep(a=NAVER_QUERY_DELAY_RANGE[0], b=NAVER_QUERY_DELAY_RANGE[1]):
     time.sleep(random.uniform(a, b))
 
 def sanitize_query(q: str) -> str:
-    # 따옴표는 보존 (앞서 문제였던 strip('"“”') 제거)
+    # 따옴표는 보존
     return q.strip()
 
 def build_url(query: str) -> str:
@@ -106,24 +103,39 @@ def normalize_link(url: str) -> str:
 def make_session(max_retry=MAX_RETRY_DEFAULT) -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": random.choice(UA_POOL), **COMMON_HEADERS})
+    r = None
     try:
         r = s.get(HOMEPAGE, timeout=8)
         r.raise_for_status()
         logger.info("네이버 쿠키 워밍업 성공")
     except Exception as e:
         logger.info(f"워밍업 실패: {e}")
-    s._max_retry = max_retry
+    finally:
+        try:
+            if r is not None:
+                r.close()  # 응답 닫기
+        except Exception:
+            pass
+    s._max_retry = max_retry  # 커스텀 속성
     return s
 
 def get_html(session: requests.Session, url: str) -> str | None:
     for attempt in range(1, getattr(session, "_max_retry", MAX_RETRY_DEFAULT) + 1):
+        r = None
         try:
             r = session.get(url, timeout=15, allow_redirects=True)
             if r.status_code == 200:
-                return r.text
+                html = r.text
+                return html
             logger.info(f"HTTP {r.status_code} (시도 {attempt})")
         except Exception as e:
             logger.info(f"요청 실패 (시도 {attempt}): {e}")
+        finally:
+            try:
+                if r is not None:
+                    r.close()  # 응답 닫기
+            except Exception:
+                pass
         time.sleep(RETRY_BACKOFF_BASE ** attempt)
     return None
 
@@ -226,6 +238,14 @@ def build_workbook(data_clients: list[dict], data_custom: list[dict] | None, dat
 st.set_page_config(page_title="네이버 뉴스 수집기", layout="wide")
 st.title("📰 네이버 뉴스 수집기 (v6 + Streamlit)")
 
+# --- 세션 상태 초기화: 엔터 제출 시 입력창 숨김용 ---
+if "custom_locked" not in st.session_state:
+    st.session_state.custom_locked = False  # 입력창 표시 여부
+if "custom_seed" not in st.session_state:
+    st.session_state.custom_seed = ""       # 제출된 원문 텍스트 저장
+if "custom_queries" not in st.session_state:
+    st.session_state.custom_queries = []    # 파싱된 검색어 리스트
+
 with st.sidebar:
     st.header("설정")
     max_n = st.slider("최대 수집 수 (유니크)", 1, 10, 10)
@@ -235,99 +255,126 @@ with st.sidebar:
     st.caption("※ 고객사/사용자 지정은 둘 다 체크 시 **합쳐서** 수집합니다.")
     run_btn = st.button("검색 시작")
 
-# 입력 영역
+# 입력 영역 (엔터 제출 → 입력창 숨김)
 custom_queries = []
 if custom_mode:
     st.subheader("사용자 지정 검색어 입력")
 
-    # Streamlit의 text_input을 사용하여 엔터 시 자동 확정
-    seed = st.text_input(
-        "검색어를 줄 단위로 입력하세요. (예: \"홈플러스\" +사고)",
-        placeholder="여러 검색어를 입력하려면 쉼표(,)로 구분하세요. 
-    )
+    if not st.session_state.custom_locked:
+        # Enter 키로 제출 가능, 제출 즉시 입력창 숨김
+        with st.form("custom_input_form", clear_on_submit=True):
+            seed = st.text_area(
+                "검색어를 줄 단위로 입력하세요. (예: \"홈플러스\" +사고)",
+                height=140,
+                help="Enter로 제출하면 입력창이 닫힙니다.",
+            )
+            submitted = st.form_submit_button("확정 (Enter)")
+        if submitted:
+            parsed = [line.strip() for line in seed.splitlines() if line.strip()]
+            st.session_state.custom_seed = seed
+            st.session_state.custom_queries = parsed
+            st.session_state.custom_locked = True  # 입력창 숨김
+            st.success(f"입력 확정: {len(parsed)}건")
+    else:
+        # 잠금 상태: 요약만 보여주고 수정/초기화 버튼 제공
+        with st.expander("제출한 검색어 보기", expanded=False):
+            st.code(st.session_state.custom_seed or "(비어 있음)")
+        st.info(
+            f"제출된 검색어 {len(st.session_state.custom_queries)}건이 확정되었습니다. "
+            "아래 버튼으로 수정할 수 있습니다."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("검색어 수정"):
+                st.session_state.custom_locked = False  # 다시 입력창 표시
+        with c2:
+            if st.button("초기화"):
+                st.session_state.custom_locked = False
+                st.session_state.custom_seed = ""
+                st.session_state.custom_queries = []
 
-    # 엔터를 누르면 바로 창 닫히고 입력 확정됨
-    if seed.strip():
-        # 쉼표 또는 줄바꿈 모두 허용
-        custom_queries = [x.strip() for x in re.split(r'[,|\n]+', seed) if x.strip()]
+    # 실행 루틴에서 사용할 실제 쿼리 목록
+    custom_queries = list(st.session_state.custom_queries)
 
 # 실행
 if run_btn:
     session = make_session()
-    clients_rows_all: list[dict] = []
-    custom_rows_all: list[dict] | None = [] if custom_mode else None
-    market_rows_all: list[dict] = []
+    try:
+        clients_rows_all: list[dict] = []
+        custom_rows_all: list[dict] | None = [] if custom_mode else None
+        market_rows_all: list[dict] = []
 
-    # 고객사 쿼리
-    client_queries = []
-    if uploaded is not None:
+        # 고객사 쿼리
+        client_queries = []
+        if uploaded is not None:
+            try:
+                df = pd.read_excel(uploaded, header=None)
+                col = df.iloc[:, 0].dropna().astype(str).str.strip()
+                # "값" +사고 형태로 생성 (따옴표 유지)
+                client_queries = [f'"{v}" +사고' for v in col if v]
+            except Exception as e:
+                st.error(f"엑셀 읽기 실패: {e}")
+
+        # 사용자 지정 쿼리(custom_queries는 위에서 세션 기반으로 준비됨)
+
+        # 고객사 실행
+        if client_queries:
+            st.info(f"고객사 {len(client_queries)}건 수집 중…")
+            progress = st.progress(0.0)
+            for idx, q in enumerate(client_queries, start=1):
+                rows = fetch_news(session, q, max_n=max_n, include_query_col=True)
+                clients_rows_all.extend(rows)
+                progress.progress(idx / max(1, len(client_queries)))
+            st.success(f"고객사 수집 완료: {len(clients_rows_all)}건")
+
+        # 사용자 지정 실행
+        if custom_mode and custom_queries:
+            st.info(f"사용자 지정 {len(custom_queries)}건 수집 중…")
+            progress = st.progress(0.0)
+            for idx, q in enumerate(custom_queries, start=1):
+                rows = fetch_news(session, q, max_n=max_n, include_query_col=True)
+                custom_rows_all.extend(rows)  # type: ignore
+                progress.progress(idx / max(1, len(custom_queries)))
+            st.success(f"사용자 지정 수집 완료: {len(custom_rows_all)}건")  # type: ignore
+
+        # 전력시장 동향
+        if include_market:
+            st.info("전력시장 동향 수집 중…")
+            market_rows_all = fetch_news(session, "전력시장 +에너지", max_n=max_n, include_query_col=False)
+            st.success(f"전력시장 동향 수집 완료: {len(market_rows_all)}건")
+
+        # 표시 & 다운로드
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("고객사 결과 미리보기")
+            df_clients = pd.DataFrame(clients_rows_all) if clients_rows_all else pd.DataFrame(columns=["query","title","snippet","link"])
+            st.dataframe(df_clients)
+
+        with col2:
+            st.subheader("전력시장 동향 미리보기")
+            df_market = pd.DataFrame(market_rows_all) if market_rows_all else pd.DataFrame(columns=["title","snippet","link"])
+            st.dataframe(df_market)
+
+        if custom_mode:
+            st.subheader("사용자 지정 결과 미리보기")
+            df_custom = pd.DataFrame(custom_rows_all) if custom_rows_all else pd.DataFrame(columns=["query","title","snippet","link"])
+            st.dataframe(df_custom)
+
+        # 엑셀 다운로드
+        bio = build_workbook(
+            data_clients=clients_rows_all,
+            data_custom=custom_rows_all if custom_mode else None,
+            data_market=market_rows_all
+        )
+        out_name = f"기사수집_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        st.download_button(
+            label="📥 엑셀 다운로드",
+            data=bio.getvalue(),
+            file_name=out_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    finally:
         try:
-            df = pd.read_excel(uploaded, header=None)
-            col = df.iloc[:, 0].dropna().astype(str).str.strip()
-            # "값" +사고 형태로 생성 (따옴표 유지)
-            client_queries = [f'"{v}" +사고' for v in col if v]
-        except Exception as e:
-            st.error(f"엑셀 읽기 실패: {e}")
-
-    # 사용자 지정 쿼리
-    if custom_mode and custom_queries:
-        # 그대로 사용 (예: 이미 " +사고" 포함한 상태로 입력했다고 가정)
-        pass
-
-    # 고객사 실행
-    if client_queries:
-        st.info(f"고객사 {len(client_queries)}건 수집 중…")
-        progress = st.progress(0.0)
-        for idx, q in enumerate(client_queries, start=1):
-            rows = fetch_news(session, q, max_n=max_n, include_query_col=True)
-            clients_rows_all.extend(rows)
-            progress.progress(idx / max(1, len(client_queries)))
-        st.success(f"고객사 수집 완료: {len(clients_rows_all)}건")
-
-    # 사용자 지정 실행
-    if custom_mode and custom_queries:
-        st.info(f"사용자 지정 {len(custom_queries)}건 수집 중…")
-        progress = st.progress(0.0)
-        for idx, q in enumerate(custom_queries, start=1):
-            rows = fetch_news(session, q, max_n=max_n, include_query_col=True)
-            custom_rows_all.extend(rows)
-            progress.progress(idx / max(1, len(custom_queries)))
-        st.success(f"사용자 지정 수집 완료: {len(custom_rows_all)}건")
-
-    # 전력시장 동향
-    if include_market:
-        st.info("전력시장 동향 수집 중…")
-        market_rows_all = fetch_news(session, "전력시장 +에너지", max_n=max_n, include_query_col=False)
-        st.success(f"전력시장 동향 수집 완료: {len(market_rows_all)}건")
-
-    # 표시 & 다운로드
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("고객사 결과 미리보기")
-        df_clients = pd.DataFrame(clients_rows_all) if clients_rows_all else pd.DataFrame(columns=["query","title","snippet","link"])
-        st.dataframe(df_clients)
-
-    with col2:
-        st.subheader("전력시장 동향 미리보기")
-        df_market = pd.DataFrame(market_rows_all) if market_rows_all else pd.DataFrame(columns=["title","snippet","link"])
-        st.dataframe(df_market)
-
-    if custom_mode:
-        st.subheader("사용자 지정 결과 미리보기")
-        df_custom = pd.DataFrame(custom_rows_all) if custom_rows_all else pd.DataFrame(columns=["query","title","snippet","link"])
-        st.dataframe(df_custom)
-
-    # 엑셀 다운로드
-    bio = build_workbook(
-        data_clients=clients_rows_all,
-        data_custom=custom_rows_all if custom_mode else None,
-        data_market=market_rows_all
-    )
-    out_name = f"기사수집_{datetime.now().strftime('%Y%m%d')}.xlsx"
-    st.download_button(
-        label="📥 엑셀 다운로드",
-        data=bio.getvalue(),
-        file_name=out_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
+            session.close()  # 세션 닫기
+        except Exception:
+            pass
