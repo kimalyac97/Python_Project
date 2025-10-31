@@ -239,9 +239,17 @@ with st.sidebar:
 custom_queries = []
 if custom_mode:
     st.subheader("사용자 지정 검색어 입력")
-    seed = st.text_area("검색어를 줄 단위로 입력하세요. (예: \"홈플러스\" +사고)", height=140)
+
+    # Streamlit의 text_input을 사용하여 엔터 시 자동 확정
+    seed = st.text_input(
+        "검색어를 줄 단위로 입력하세요. (예: \"홈플러스\" +사고)",
+        placeholder="여러 검색어를 입력하려면 쉼표(,)로 구분하세요. 
+    )
+
+    # 엔터를 누르면 바로 창 닫히고 입력 확정됨
     if seed.strip():
-        custom_queries = [line.strip() for line in seed.splitlines() if line.strip()]
+        # 쉼표 또는 줄바꿈 모두 허용
+        custom_queries = [x.strip() for x in re.split(r'[,|\n]+', seed) if x.strip()]
 
 # 실행
 if run_btn:
@@ -322,3 +330,4 @@ if run_btn:
         file_name=out_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
